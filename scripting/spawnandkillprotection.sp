@@ -6,6 +6,11 @@
 #include <sdkhooks>
 #include <smlib>
 
+#undef REQUIRE_EXTENSIONS
+#define AUTOLOAD_EXTENSIONS
+
+#include "collisionhook"
+
 #define PLUGIN_VERSION "1.4.5"
 
 #define KILLPROTECTION_DISABLE_BUTTONS (IN_ATTACK | IN_JUMP | IN_DUCK | IN_FORWARD | IN_BACK | IN_USE | IN_LEFT | IN_RIGHT | IN_MOVELEFT | IN_MOVERIGHT | IN_ATTACK2 | IN_RUN |  IN_WALK | IN_GRENADE1 | IN_GRENADE2 )
@@ -67,13 +72,14 @@ new Handle:collisiongroupcvar               = INVALID_HANDLE;
 
 // Misc
 new bool:bNoBlock                           = true;
-new defaultcollisiongroup                   = 8;
+new defaultcollisiongroup                   = _:COLLISION_GROUP_PLAYER_MOVEMENT;
 new bool:isKillProtected[MAXPLAYERS+1]      = { false, ... };
 new bool:isSpawnKillProtected[MAXPLAYERS+1] = { false, ... };
 new bool:isWallKillProtected[MAXPLAYERS+1]  = { false, ... };
 new Handle:activeDisableTimer[MAXPLAYERS+1] = { INVALID_HANDLE, ... };
 new Float:keyPressOnTime[MAXPLAYERS+1]      = { 0.0, ... };
 new timeLookingAtWall[MAXPLAYERS+1]         = { 0, ... };
+new bool:isTryingToUnStuck[MAXPLAYERS+1];   // Whether player became unprotected but they're currently stuck
 new Handle:hudSynchronizer                  = INVALID_HANDLE;
 
 
@@ -117,9 +123,11 @@ public OnPluginStart()
 	
 	HookConVarChange(noblock, ConVarChange_Noblock);
 
-	collisiongroupcvar       = Sakp_CreateConVar("collisiongroup", "8", "Collision group players are part of.  Change to match group if you are using a noblock or anti stick plugin");
+	decl String:buffer[INT_MAX_DIGITS];
+	IntToString(defaultcollisiongroup, buffer, sizeof(buffer));
+	collisiongroupcvar       = Sakp_CreateConVar("collisiongroup", buffer, "Collision group players are part of.  Change to match group if you are using a noblock or anti stuck plugin.");
 	defaultcollisiongroup    = GetConVarInt(collisiongroupcvar);
-        HookConVarChange(collisiongroupcvar, ConVarChange_CollisionGroup);
+	HookConVarChange(collisiongroupcvar, ConVarChange_CollisionGroup);
 
 	disableonmoveshoot       = Sakp_CreateConVar("disableonmoveshoot", "1", "0 = don't disable, 1 = disable the spawnprotection when player moves or shoots, 2 = disable the spawn protection when shooting only");
 	disableweapondamage      = Sakp_CreateConVar("disableweapondamage", "0", "0 = spawn protected players can inflict damage, 1 = spawn protected players inflict no damage");
@@ -195,6 +203,7 @@ public OnClientPutInServer(client)
 	isWallKillProtected[client] = false;
 	keyPressOnTime[client] = 0.0;
 	timeLookingAtWall[client] = 0;
+	isTryingToUnStuck[client] = false;
 
 	SDKHook(client, SDKHook_OnTakeDamage,  Hook_OnTakeDamage);
 	SDKHook(client, SDKHook_ShouldCollide, Hook_ShouldCollide);
@@ -242,7 +251,12 @@ public OnGameFrame()
 
 			new Float:disabletime_value = GetDisableTime(client);
 			if (disabletime_value > 0.0) {
-				activeDisableTimer[client] = CreateTimer(disabletime_value, Timer_DisableSpawnProtection, GetClientUserId(client), TIMER_FLAG_NO_MAPCHANGE);
+				activeDisableTimer[client] = CreateTimer(disabletime_value, Timer_DisableSpawnProtection,
+					GetClientUserId(client), TIMER_FLAG_NO_MAPCHANGE);
+
+				if (bNoBlock || isTryingToUnStuck[client]) {
+					CheckStuck(client);
+				}
 			}
 			else {
 				DisableKillProtection(client);
@@ -284,8 +298,21 @@ public ConVarChange_Enabled(Handle:convar, const String:oldValue[], const String
 public ConVarChange_Noblock(Handle:convar, const String:oldValue[], const String:newValue[])
 {
 	bNoBlock = bool:StringToInt(newValue);
-}
 
+	if (bNoBlock != bool:StringToInt(oldValue)) {
+		LOOP_CLIENTS(client, CLIENTFILTER_INGAME) {
+			// Check the partial ShouldApplyNoBlockAgainst conditions that may allow
+			// the new NoBlock value to change function's return value, for optimization
+			if (isKillProtected[client] && activeDisableTimer[client] == INVALID_HANDLE && !isTryingToUnStuck[client]) {
+				if (bNoBlock) {
+					SetEntityCollisionGroup(client, _:COLLISION_GROUP_DEBRIS_TRIGGER);
+				} else {
+					CheckStuck(client);
+				}
+			}
+		}
+	}
+}
 
 public ConVarChange_CollisionGroup(Handle:convar, const String:oldValue[], const String:newValue[])
 {
@@ -334,12 +361,17 @@ public Action:Timer_CheckWall(Handle:timer)
 				OnClientDisconnect(client);
 				isWallKillProtected[client] = true;
 				EnableKillProtection(client);
+				continue;
 			}
 			
 			timeLookingAtWall[client]++;
 		}
 		else {
 			timeLookingAtWall[client] = 0;
+		}
+
+		if (isTryingToUnStuck[client]) {
+			CheckStuck(client);
 		}
 	}
 	
@@ -395,18 +427,35 @@ public Action:Hook_OnTakeDamage(victim, &attacker, &inflictor, &Float:damage, &d
 	return Plugin_Changed;
 }
 
-public bool:Hook_ShouldCollide(entity, collisiongroup, contentsmask, bool:originalResult)
+public bool:Hook_ShouldCollide(client, collisiongroup, contentsmask, bool:originalResult)
 {
-	if(collisiongroup != defaultcollisiongroup){		
-		return(true);
-	}
-	if (isKillProtected[entity] && bNoBlock ) {
-		return false;
-	}
-	return true;
+	return (ShouldApplyNoBlockAgainst(client) ? false : originalResult);
 }
 
+public Action:CH_PassFilter(entity, other, &bool:result)
+{
+	return CH_ShouldCollide(entity, other, result);
+}
 
+public Action:CH_ShouldCollide(entity, other, &bool:result)
+{
+	if (entity <= MaxClients && ShouldApplyNoBlockAgainst(entity)
+		|| other <= MaxClients && ShouldApplyNoBlockAgainst(other)) {
+		result = false;
+		return Plugin_Changed;
+	}
+
+	return Plugin_Continue;
+}
+
+bool:ShouldApplyNoBlockAgainst(client)
+{
+	// Accept if the client is protected (along with the NoBlock setting enabled) and not triggering delayed unprotection
+	// from pressed buttons (so that client won't be able to pass through objects not initially colliding with during it),
+	// or if de-protection was requested and client is currently stuck
+	return (bNoBlock && isKillProtected[client] && activeDisableTimer[client] == INVALID_HANDLE
+		|| isTryingToUnStuck[client]);
+}
 
 /*****************************************************************
 
@@ -538,7 +587,7 @@ EnableKillProtection(client)
 		return;
 	}
 
-	isKillProtected[client] =  true;
+	isKillProtected[client] = true;
 	keyPressOnTime[client] = GetGameTime() + GetKeyPressIgnoreTime(client);
 	SetEntityRenderMode(client, RENDER_TRANSCOLOR);
 	SetEntityRenderColor(client, GetConVarInt(player_color_r), GetConVarInt(player_color_g), GetConVarInt(player_color_b), GetConVarInt(player_color_a));
@@ -549,6 +598,14 @@ EnableKillProtection(client)
 		
 	if (GetConVarBool(fadescreen)) {
 		Client_ScreenFade(client, 0, FFADE_OUT | FFADE_STAYOUT | FFADE_PURGE, -1, 0, 0, 0, 240);
+	}
+
+	if (bNoBlock) {
+		if (!isTryingToUnStuck[client]) {
+			SetEntityCollisionGroup(client, _:COLLISION_GROUP_DEBRIS_TRIGGER);
+		}
+
+		isTryingToUnStuck[client] = false;
 	}
 
 	NotifyClientEnableProtection(client);
@@ -579,6 +636,27 @@ DisableKillProtection(client)
 	if (GetConVarBool(fadescreen)) {
 		Client_ScreenFade(client, 0, FFADE_IN | FFADE_PURGE, -1, 0, 0, 0, 0);
 	}
+
+	if (bNoBlock || isTryingToUnStuck[client]) {
+		CheckStuck(client);
+	}
+}
+
+CheckStuck(client)
+{
+	decl Float:origin[3], Float:mins[3], Float:maxs[3];
+	GetClientAbsOrigin(client, origin);
+	Entity_GetMinSize(client, mins);
+	Entity_GetMaxSize(client, maxs);
+	TR_TraceHullFilter(origin, origin, mins, maxs, MASK_PLAYERSOLID, StuckTraceFilter, client);
+	isTryingToUnStuck[client] = TR_DidHit();
+	SetEntityCollisionGroup(client, isTryingToUnStuck[client] ?
+		(_:COLLISION_GROUP_DEBRIS_TRIGGER) : defaultcollisiongroup);
+}
+
+bool:StuckTraceFilter(entity, contentsMask, client)
+{
+	return (entity != client && Entity_GetCollisionGroup(entity) != COLLISION_GROUP_WEAPON);
 }
 
 DisableKillProtectionAll()
