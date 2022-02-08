@@ -340,21 +340,6 @@ public Action:Timer_CheckWall(Handle:timer)
 		}
 		else {
 			timeLookingAtWall[client] = 0;
-			
-			if (isKillProtected[client] && activeDisableTimer[client] != INVALID_HANDLE) {
-				
-				if (isWallKillProtected[client]) {
-					isWallKillProtected[client] = false;
-					
-					new Float:disabletime_value = GetDisableTime(client);
-					if (disabletime_value > 0.0) {
-						activeDisableTimer[client] = CreateTimer(disabletime_value, Timer_DisableSpawnProtection, GetClientUserId(client), TIMER_FLAG_NO_MAPCHANGE);
-					}
-					else {
-						DisableKillProtection(client);
-					}
-				}
-			}
 		}
 	}
 	
