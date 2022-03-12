@@ -82,7 +82,8 @@ new timeLookingAtWall[MAXPLAYERS+1]         = { 0, ... };
 new bool:isTryingToUnStuck[MAXPLAYERS+1];   // Whether player became unprotected but they're currently stuck
 new Handle:hudSynchronizer                  = INVALID_HANDLE;
 
-
+bool:disableCheckingMayhemBug[MAXPLAYERS + 1];
+bool:allowedNoBlockApplyValue[MAXPLAYERS + 1];
 
 /*****************************************************************
 
@@ -198,6 +199,8 @@ public OnPluginEnd()
 
 public OnClientPutInServer(client)
 {	
+	disableCheckingMayhemBug[client] = false;
+	allowedNoBlockApplyValue[client] = false;
 	isKillProtected[client] = false;
 	isSpawnKillProtected[client] = false;
 	isWallKillProtected[client] = false;
@@ -305,7 +308,7 @@ public ConVarChange_Noblock(Handle:convar, const String:oldValue[], const String
 			// the new NoBlock value to change function's return value, for optimization
 			if (isKillProtected[client] && activeDisableTimer[client] == INVALID_HANDLE && !isTryingToUnStuck[client]) {
 				if (bNoBlock) {
-					SetEntityCollisionGroup(client, _:COLLISION_GROUP_DEBRIS_TRIGGER);
+					SetEntityCollisionGroupEx(client, _:COLLISION_GROUP_DEBRIS_TRIGGER);
 				} else {
 					CheckStuck(client);
 				}
@@ -439,8 +442,8 @@ public Action:CH_PassFilter(entity, other, &bool:result)
 
 public Action:CH_ShouldCollide(entity, other, &bool:result)
 {
-	if (entity <= MaxClients && ShouldApplyNoBlockAgainst(entity)
-		|| other <= MaxClients && ShouldApplyNoBlockAgainst(other)) {
+	if (entity <= MaxClients && ShouldApplyNoBlockAgainst(entity, other)
+		|| other <= MaxClients && ShouldApplyNoBlockAgainst(other, entity)) {
 		result = false;
 		return Plugin_Changed;
 	}
@@ -448,13 +451,25 @@ public Action:CH_ShouldCollide(entity, other, &bool:result)
 	return Plugin_Continue;
 }
 
-bool:ShouldApplyNoBlockAgainst(client)
+bool:ShouldApplyNoBlockAgainst(client, other = 1)
 {
 	// Accept if the client is protected (along with the NoBlock setting enabled) and not triggering delayed unprotection
 	// from pressed buttons (so that client won't be able to pass through objects not initially colliding with during it),
 	// or if de-protection was requested and client is currently stuck
-	return (bNoBlock && isKillProtected[client] && activeDisableTimer[client] == INVALID_HANDLE
+	decl bool:result = (bNoBlock && isKillProtected[client] && activeDisableTimer[client] == INVALID_HANDLE
 		|| isTryingToUnStuck[client]);
+	
+	if (client > 0 && !disableCheckingMayhemBug[client] && (other < 1 || other > MaxClients)
+		&& result != allowedNoBlockApplyValue[client])
+	{
+		decl String:classname[MAX_NAME_LENGTH];
+		GetEntityClassname(other, classname, sizeof(classname));
+		LogStackTrace("ShouldApplyNoBlockAgainst would return non-allowed value %i and may trigger Physics Mayhem Bug!"
+			... " (client = %N, other = '%s', isKillProtected = %i, activeDisableTimer = %i, isTryingToUnStuck = %i)",
+			result, client, classname, isKillProtected[client], activeDisableTimer[client], isTryingToUnStuck[client]);
+	}
+
+	return result;
 }
 
 /*****************************************************************
@@ -602,7 +617,7 @@ EnableKillProtection(client)
 
 	if (bNoBlock) {
 		if (!isTryingToUnStuck[client]) {
-			SetEntityCollisionGroup(client, _:COLLISION_GROUP_DEBRIS_TRIGGER);
+			SetEntityCollisionGroupEx(client, _:COLLISION_GROUP_DEBRIS_TRIGGER);
 		}
 
 		isTryingToUnStuck[client] = false;
@@ -648,15 +663,25 @@ CheckStuck(client)
 	GetClientAbsOrigin(client, origin);
 	Entity_GetMinSize(client, mins);
 	Entity_GetMaxSize(client, maxs);
+	disableCheckingMayhemBug[client] = true;
 	TR_TraceHullFilter(origin, origin, mins, maxs, MASK_PLAYERSOLID, StuckTraceFilter, client);
+	disableCheckingMayhemBug[client] = false;
 	isTryingToUnStuck[client] = TR_DidHit();
-	SetEntityCollisionGroup(client, isTryingToUnStuck[client] ?
+	SetEntityCollisionGroupEx(client, isTryingToUnStuck[client] ?
 		(_:COLLISION_GROUP_DEBRIS_TRIGGER) : defaultcollisiongroup);
 }
 
 bool:StuckTraceFilter(entity, contentsMask, client)
 {
 	return (entity != client && Entity_GetCollisionGroup(entity) != COLLISION_GROUP_WEAPON);
+}
+
+SetEntityCollisionGroupEx(int client, int collisionGroup)
+{
+	disableCheckingMayhemBug[client] = true;
+	SetEntityCollisionGroup(client, collisionGroup);
+	disableCheckingMayhemBug[client] = false;
+	allowedNoBlockApplyValue[client] = ShouldApplyNoBlockAgainst(client);
 }
 
 DisableKillProtectionAll()
