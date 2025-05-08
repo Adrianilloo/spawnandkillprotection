@@ -7,7 +7,6 @@
 #include <smlib>
 
 #undef REQUIRE_EXTENSIONS
-#define AUTOLOAD_EXTENSIONS
 
 #include "collisionhook"
 
@@ -417,7 +416,7 @@ public Action:Hook_OnTakeDamage(victim, &attacker, &inflictor, &Float:damage, &d
 								Float:damageForce[3], Float:damagePosition[3], damagecustom)
 {	
 	if (isKillProtected[victim]) {
-		ProtectedPlayerHurted(victim, inflictor, RoundToFloor(damage));
+		ProtectedPlayerHurted(inflictor, RoundToFloor(damage));
 	}
 	else if (!GetConVarBool(disableweapondamage) || attacker > MaxClients || !isKillProtected[attacker]) {
 		return Plugin_Continue;
@@ -553,7 +552,7 @@ CreateTestHudSynchronizer()
 	}
 }
 
-stock ProtectedPlayerHurted(client, inflictor, damage)
+stock ProtectedPlayerHurted(inflictor, damage)
 {	
 	if (!Client_IsValid(inflictor, false)) {
 		return;
